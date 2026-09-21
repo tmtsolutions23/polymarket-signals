@@ -69,8 +69,16 @@ for (const p of picks) {
   const drifted = prev && prev.drift != null && drift != null && Math.abs(drift - prev.drift) > DRIFT_TOLERANCE;
   const gapOk = !prev || !prev.ts || (now - new Date(prev.ts).getTime()) >= RE_POST_MIN_GAP_MS;
   const isNew = !prev || (drifted && gapOk);
-  signals[key] = { drift, ts: new Date().toISOString() };
-  if (isNew) fresh.push(p);
+  // Fix: only anchor drift/ts to the LAST POSTED state, not every scan. The pipeline
+  // scans hourly (60min) but requires a 90min gap before a drift-based repost — if this
+  // update ran unconditionally, prev.ts/prev.drift tracked the last *scan* instead of the
+  // last *post*, so gapOk could never be true and drift was compared hour-over-hour
+  // instead of since-last-post, silently muting reposts for any signal that kept
+  // reappearing every scan (exactly the slow-drift case this gate exists to catch).
+  if (isNew) {
+    signals[key] = { drift, ts: new Date().toISOString() };
+    fresh.push(p);
+  }
 }
 if (fs) {
   try { fs.writeFileSync(STATE, JSON.stringify(state)); } catch (e) { console.error('[change gate] state write failed: ' + e.message); }
