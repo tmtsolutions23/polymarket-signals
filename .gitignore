@@ -1,0 +1,13 @@
+*.pyc
+__pycache__/
+.DS_Store
+*.log
+secrets/
+*.pem
+*_key.txt
+.env
+last_posted.json
+*.service
+*.sh
+code_*.txt
+api_test.sh

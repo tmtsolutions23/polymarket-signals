@@ -1,0 +1,645 @@
+{
+ "id": "4MqMruEVp1YutQf7",
+ "name": "Polymarket Smart Money Consensus \u2014 07:00+18:00 NY",
+ "nodes": [
+  {
+   "id": "00000000-0000-4000-8000-000000000001",
+   "name": "Webhook (manual run)",
+   "type": "n8n-nodes-base.webhook",
+   "typeVersion": 2,
+   "position": [
+    0,
+    340
+   ],
+   "webhookId": "a7f3c9e2b14d4e8f9a6c2d5b7e8f1a0b",
+   "parameters": {
+    "httpMethod": "POST",
+    "path": "poly-consensus",
+    "responseMode": "onReceived",
+    "options": {}
+   }
+  },
+  {
+   "id": "00000000-0000-4000-8000-000000000002",
+   "name": "Schedule (daily 07:00+18:00 NY)",
+   "type": "n8n-nodes-base.scheduleTrigger",
+   "typeVersion": 1.2,
+   "position": [
+    0,
+    60
+   ],
+   "parameters": {
+    "rule": {
+     "interval": [
+      {
+       "field": "cronExpression",
+       "expression": "0 7,18 * * *"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "id": "00000000-0000-4000-8000-000000000003",
+   "name": "HTTP Leaderboard",
+   "type": "n8n-nodes-base.httpRequest",
+   "typeVersion": 4.2,
+   "position": [
+    260,
+    200
+   ],
+   "parameters": {
+    "method": "GET",
+    "url": "https://data-api.polymarket.com/v1/leaderboard?category=OVERALL&timePeriod=MONTH&orderBy=PNL&limit=50",
+    "sendHeaders": false,
+    "sendBody": false,
+    "sendQuery": false,
+    "options": {
+     "timeout": 60000
+    }
+   }
+  },
+  {
+   "id": "00000000-0000-4000-8000-000000000004",
+   "name": "Prep Traders",
+   "type": "n8n-nodes-base.code",
+   "typeVersion": 2,
+   "position": [
+    520,
+    200
+   ],
+   "parameters": {
+    "mode": "runOnceForAllItems",
+    "jsCode": "// Take top 40 by PnL, keep only what we need\nconst traders = $input.all()\n  .map(i => i.json)\n  .filter(t => t.proxyWallet && t.pnl > 0)\n  .slice(0, 40)\n  .map(t => ({ json: {\n    proxyWallet: t.proxyWallet,\n    userName: t.userName || t.proxyWallet.slice(0, 8),\n    rank: t.rank,\n    pnl: t.pnl,\n    vol: t.vol,\n    verified: t.verifiedBadge === true\n  }}));\nreturn traders;"
+   }
+  },
+  {
+   "id": "00000000-0000-4000-8000-000000000005",
+   "name": "HTTP Trades (per trader)",
+   "type": "n8n-nodes-base.httpRequest",
+   "typeVersion": 4.2,
+   "position": [
+    780,
+    200
+   ],
+   "parameters": {
+    "method": "GET",
+    "url": "=https://data-api.polymarket.com/trades?user={{ $json.proxyWallet }}&limit=200",
+    "sendHeaders": false,
+    "sendBody": false,
+    "sendQuery": false,
+    "options": {
+     "timeout": 60000,
+     "batch": {
+      "batchSize": 1,
+      "batchInterval": 1500
+     },
+     "retryOnFail": true,
+     "maxTries": 3,
+     "waitBetweenTries": 2000
+    }
+   }
+  },
+  {
+   "id": "00000000-0000-4000-8000-000000000006",
+   "name": "Fresh BUYs (48h)",
+   "type": "n8n-nodes-base.code",
+   "typeVersion": 2,
+   "position": [
+    1040,
+    200
+   ],
+   "parameters": {
+    "mode": "runOnceForAllItems",
+    "jsCode": "// Keep only BUY trades from the last 48h \u2014 positions are stale, fresh entries are the signal\nconst cutoff = Date.now() - 48 * 3600 * 1000;\nconst out = [];\nfor (const it of $input.all()) {\n  const t = it.json;\n  if (!t || t.side !== 'BUY') continue;\n  if (!t.conditionId || !t.asset) continue;\n  if (t.timestamp * 1000 < cutoff) continue;\n  out.push({ json: {\n    wallet: t.proxyWallet,\n    traderName: t.name || t.proxyWallet.slice(0, 8),\n    asset: t.asset,\n    conditionId: t.conditionId,\n    outcome: t.outcome,\n    title: t.title,\n    slug: t.slug,\n    eventSlug: t.eventSlug,\n    shares: t.size,\n    price: t.price,\n    usd: Math.round(t.size * t.price),\n    ts: t.timestamp\n  }});\n}\nreturn out;"
+   }
+  },
+  {
+   "id": "00000000-0000-4000-8000-000000000007",
+   "name": "Find Consensus",
+   "type": "n8n-nodes-base.code",
+   "typeVersion": 2,
+   "position": [
+    1300,
+    200
+   ],
+   "parameters": {
+    "mode": "runOnceForAllItems",
+    "jsCode": "// Group fresh BUYs by token; count distinct top MONTH-PNL traders per outcome\n// (verifiedBadge is false for all top-50 traders \u2014 identity filters unusable; quality comes from size/freshness/settle/drift gates downstream)\nconst buys = $input.all().map(i => i.json);\nconst groups = new Map();\nfor (const b of buys) {\n  if (!groups.has(b.asset)) {\n    groups.set(b.asset, {\n      asset: b.asset,\n      conditionId: b.conditionId,\n      outcome: b.outcome,\n      title: b.title,\n      slug: b.slug,\n      eventSlug: b.eventSlug,\n      wallets: new Map(),\n      totalUsd: 0,\n      priceSum: 0,\n      weightedPriceSum: 0,\n      totalShares: 0,\n      count: 0,\n      lastTs: 0\n    });\n  }\n  const g = groups.get(b.asset);\n  g.wallets.set(b.wallet, b.traderName);\n  g.totalUsd += b.usd;\n  g.priceSum += b.price;\n  g.weightedPriceSum += b.price * (b.shares || 0);\n  g.totalShares += (b.shares || 0);\n  g.count++;\n  g.lastTs = Math.max(g.lastTs, b.ts);\n}\nconst MIN_TRADERS = 3; // consensus threshold\nconst picks = [...groups.values()]\n  .filter(g => g.wallets.size >= MIN_TRADERS)\n  .map(g => ({\n    asset: g.asset,\n    conditionId: g.conditionId,\n    outcome: g.outcome,\n    title: g.title,\n    slug: g.slug,\n    eventSlug: g.eventSlug,\n    skip: false,\n    traderCount: g.wallets.size,\n    traderNames: [...g.wallets.entries()].map(([w, n]) => n || w.slice(0, 8)),\n    totalUsd: Math.round(g.totalUsd),\n    avgEntryPrice: g.totalShares > 0 ? +(g.weightedPriceSum / g.totalShares).toFixed(3) : +(g.priceSum / g.count).toFixed(3),\n    lastEntryTs: g.lastTs\n  }))\n  .sort((a, b) => b.traderCount - a.traderCount || b.totalUsd - a.totalUsd);\n// Always emit at least one item so the router node always executes\nif (picks.length === 0) {\n  return [{ json: { skip: true, message: 'No strong smart-money consensus found in the last 48h.' } }];\n}\nreturn picks.map(p => ({ json: p }));"
+   }
+  },
+  {
+   "id": "00000000-0000-4000-8000-000000000008",
+   "name": "Verify Query",
+   "type": "n8n-nodes-base.code",
+   "typeVersion": 2,
+   "position": [
+    1560,
+    60
+   ],
+   "parameters": {
+    "mode": "runOnceForAllItems",
+    "jsCode": "// Group picks by EVENT: trades API eventSlug is inconsistent (slug OR numeric id).\n// Numeric ids -> resolve via the market slug (sports market slug == event slug).\nconst picks = $input.all().map(i => i.json).filter(p => p.skip !== true && (p.eventSlug || p.slug));\nconst byEvent = new Map();\nfor (const p of picks) {\n  const key = /^\\d+$/.test(String(p.eventSlug)) ? p.slug : p.eventSlug;\n  if (!key) continue;\n  if (!byEvent.has(key)) byEvent.set(key, []);\n  byEvent.get(key).push(p);\n}\nif (byEvent.size === 0) return [];\nreturn [...byEvent.keys()].map(s => ({ json: { eventSlug: s } }));"
+   }
+  },
+  {
+   "id": "00000000-0000-4000-8000-000000000009",
+   "name": "HTTP Gamma (verify markets)",
+   "type": "n8n-nodes-base.httpRequest",
+   "typeVersion": 4.2,
+   "position": [
+    1820,
+    60
+   ],
+   "parameters": {
+    "method": "GET",
+    "url": "=https://gamma-api.polymarket.com/events?slug={{ $json.eventSlug }}",
+    "sendHeaders": false,
+    "sendBody": false,
+    "sendQuery": false,
+    "options": {
+     "timeout": 60000,
+     "batch": {
+      "batchSize": 1,
+      "batchInterval": 400
+     },
+     "retryOnFail": true,
+     "maxTries": 3,
+     "waitBetweenTries": 1500
+    }
+   }
+  },
+  {
+   "id": "00000000-0000-4000-8000-000000000010",
+   "name": "Verify & Enrich",
+   "type": "n8n-nodes-base.code",
+   "typeVersion": 2,
+   "position": [
+    1560,
+    340
+   ],
+   "parameters": {
+    "mode": "runOnceForAllItems",
+    "jsCode": "// Verification: match picks to gamma event markets by slug (fallback: clob token id)\nconst all = $input.all().map(i => i.json);\nconst picks = all.filter(x => x.asset);\nconst events = all.filter(x => Array.isArray(x.markets));\nconst out = [];\nfor (const p of picks) {\n  const ev = events.find(e => e.slug === p.eventSlug);\n  if (!ev) continue;\n  const mkts = ev.markets || [];\n  let m = mkts.find(x => x.slug === p.slug);\n  if (!m) m = mkts.find(x => (x.clobTokenIds || '').split(',').map(s => s.replace(/[\\[\\]\"]/g, '')).includes(String(p.asset)));\n  if (!m) continue;\n  const liq = parseFloat(m.liquidity || '0') || 0;\n  if (m.closed === true || m.active === false || liq < 5000) continue;\n  const endMs = m.endDate ? new Date(m.endDate).getTime() : null;\n  const settleDays = endMs ? Math.ceil((endMs - Date.now()) / 86400000) : null;\n  // F3 fix: settleDays <= 0 = market already settled/ended \u2014 reject, was passing before\n  if (settleDays !== null && (settleDays <= 0 || settleDays > 7)) continue; // no settled markets, no long holds\n  let outcomes = [], prices = [];\n  try { outcomes = JSON.parse(m.outcomes || '[]'); } catch (e) {}\n  try { prices = (JSON.parse(m.outcomePrices || '[]')).map(x => parseFloat(x)); } catch (e) {}\n  const idx = outcomes.indexOf(p.outcome);\n  const curPrice = idx >= 0 && prices[idx] !== undefined ? prices[idx] : null;\n  out.push({ json: {\n    ...p,\n    marketQuestion: m.question,\n    liquidity: Math.round(liq),\n    currentPrice: curPrice,\n    edge: curPrice !== null ? +(curPrice - p.avgEntryPrice).toFixed(3) : null,\n    marketUrl: `https://polymarket.com/event/${ev.slug}`,\n    endDate: m.endDate,\n    settleDays\n  }});\n}\n// If the input was already a no-picks skip, emit nothing (router already posted the notice)\nif (picks.length === 0) {\n  return all.some(x => x.skip === true) ? [] : [{ json: { skip: true, message: 'Consensus found but no tradeable markets (closed or too thin).' } }];\n}\nif (out.length === 0) {\n  return [{ json: { skip: true, message: 'Consensus found but no tradeable markets (closed or too thin).' } }];\n}\nreturn out;"
+   }
+  },
+  {
+   "id": "da3f395a-b562-4347-96c2-b14def92fcf5",
+   "name": "US Availability Gate",
+   "type": "n8n-nodes-base.code",
+   "typeVersion": 2,
+   "position": [
+    1740,
+    340
+   ],
+   "parameters": {
+    "jsCode": "// US Availability Gate (HERMES-009): the user trades on the CFTC-regulated US exchange,\n// so a signal is only actionable if the market is listed on polymarket.us. Verify each\n// pick's event on gateway.polymarket.us and rewrite links to the .us domain.\nconst picks = $input.all().map(i => i.json);\nif (picks[0] && picks[0].skip === true) {\n  return [{ json: picks[0] }];\n}\nconst API = 'https://gateway.polymarket.us/v1/events?slug=';\nconst TIMEOUT_MS = 8000;\n\nasync function check(p) {\n  // n8n Code-node sandbox has neither fetch nor AbortController; helpers are exposed as plain `helpers` (no $).\n  // Use helpers.httpRequest + Promise.race timeout.\n  const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error('gateway timeout')), TIMEOUT_MS));\n  try {\n    const res = await Promise.race([\n      helpers.httpRequest({\n        method: 'GET',\n        url: API + encodeURIComponent(p.eventSlug || p.slug || ''),\n        headers: { 'User-Agent': 'polymarket-consensus-scanner/1.0' },\n        json: true\n      }),\n      timeout\n    ]);\n    let data = res && res.data;\n    if (typeof data === 'string') {\n      try { data = JSON.parse(data); } catch (e) { data = {}; }\n    }\n    const ev = (data && data.events || [])[0];\n    if (!ev) {\n      return { ...p, usAvailable: false, usReason: 'not listed on Polymarket US' };\n    }\n    const numMarkets = ev.marketCounts && ev.marketCounts.numMarkets != null ? ev.marketCounts.numMarkets : ((ev.markets || []).length);\n    if (ev.closed === true || numMarkets === 0) {\n      return { ...p, usAvailable: false, usReason: 'closed on Polymarket US' };\n    }\n    return { ...p, usAvailable: true, usReason: null, marketUrl: 'https://polymarket.us/event/' + ev.slug, usTitle: ev.title };\n  } catch (err) {\n    const msg = String((err && (err.message || err.error)) || err);\n    return { ...p, usAvailable: false, usReason: 'gateway error (' + msg.slice(0, 60) + ')' };\n  }\n}\n\nconst run = async () => {\n  const results = await Promise.all(picks.map(check));\n  const ok = results.filter(r => r.usAvailable);\n  const dropped = results.filter(r => !r.usAvailable);\n  let note = null;\n  if (dropped.length > 0) {\n    const names = dropped.map(x => String(x.title || '?')).map(t => t.length > 38 ? t.slice(0, 36) + '\u2026' : t);\n    note = '\u26a0\ufe0f ' + dropped.length + ' signal' + (dropped.length > 1 ? 's' : '') + ' not available on Polymarket US'\n      + (dropped.length <= 6 ? ' (' + names.join('; ') + ')' : '') + ' \u2014 excluded.';\n  }\n  if (ok.length === 0) {\n    return [{ json: { skip: true, message: 'Signals found but none are available on Polymarket US (' + (dropped[0] ? dropped[0].usReason : 'check failed') + ').' } }];\n  }\n  return ok.map(p => ({ json: { ...p, usNote: note } }));\n};\nreturn run();\n"
+   }
+  },
+  {
+   "id": "00000000-0000-4000-8000-000000000011",
+   "name": "Prompt & Route",
+   "type": "n8n-nodes-base.code",
+   "typeVersion": 2,
+   "position": [
+    1820,
+    200
+   ],
+   "parameters": {
+    "mode": "runOnceForAllItems",
+    "jsCode": "// Build the copy-trading signal prompt: is it still early enough to follow smart money?\nconst inputItems = $input.all().map(i => i.json);\nif (inputItems[0] && inputItems[0].skip === true) {\n  return [{ json: { skip: true, message: inputItems[0].message || 'No tradeable picks.' } }];\n}\nconst bankroll = $('Bankroll Parse').first().json.bankroll;\n// Noise pre-filter (HERMES-007 F4): only >= $10k smart-money volume reaches the report\nconst picks = inputItems.filter(p => (p.totalUsd || 0) >= 10000).slice(0, 10);\nif (!picks.length) {\n  return [{ json: { skip: true, message: 'No signals above $10k smart-money this run.' } }];\n}\nconst nowS = Date.now() / 1000;\nconst compact = picks.map((p, i) => {\n  const drift = (p.avgEntryPrice > 0 && p.currentPrice != null) ? ((p.currentPrice - p.avgEntryPrice) / p.avgEntryPrice * 100) : null;\n  return {\n    id: i,\n    market: p.title,\n    candidate_side: p.outcome,\n    entry_price: p.avgEntryPrice,\n    current_price: p.currentPrice,\n    drift_pct: drift != null ? +drift.toFixed(1) : null,\n    hours_ago: p.lastEntryTs ? Math.max(0, Math.round((nowS - p.lastEntryTs) / 3600)) : null,\n    smart_money_usd: p.totalUsd,\n    traders: p.traderCount,\n    liquidity: p.liquidity,\n    settles_in_days: p.settleDays,\n    url: p.marketUrl,\n    slug: p.slug,\n    asset: String(p.asset)\n  };\n});\nconst promptText = `You are a Polymarket copy-trading signal analyst. Polymarket is largely efficient \u2014 we do not try to beat the market. The play: when several top traders buy the same side within 48h, follow them EARLY and ride the move (their continued buying and information advantage push the price). Your job per pick: say whether it is still worth copying NOW.\n\nFor EACH pick output:\n- \"side\": the exact outcome name from candidate_side (e.g. 'Yes', 'G2', 'Over' \u2014 do NOT force YES/NO for sports markets)\n- \"price\": current price as number\n- \"prob\": your honest estimate (0-1) of the probability this side wins/profits. If the smart-money signal is strong and fresh, prob may exceed price even though the market is fair overall.\n- \"reason\": one short line, max 12 words: the strongest reason to copy NOW or NOT (e.g. \"fresh 5-trader buy, price flat\" / \"already ran +18%, late\" / \"thin book\").\n\nRules:\n- These markets all settle within 7 days \u2014 we ride the move, we do not hold to settlement. prob is your honest estimate of the probability the side wins or drifts profitably in the next few days, using the smart-money signal as evidence \u2014 do NOT simply mirror the market price. A fresh multi-trader consensus near their entry price is a real signal.\n- If the price already ran far from their entry, prob should be close to price (edge gone) and say so in the reason.\n- If drift is negative (price BELOW their entry), that is a better copy entry \u2014 say so.\n- Be terse. Never mention hedging, gambling warnings, or \"the market is mispriced\".\n\nDATA:\n${JSON.stringify(compact, null, 1)}\n\nReply with ONLY a JSON block (no markdown outside it):\n{\n  \"picks\": [\n    {\"id\": index_from_data, \"market\": \"...\", \"side\": \"exact outcome name from candidate_side\", \"price\": current_price_as_number, \"prob\": probability_0_to_1_that_this_side_wins, \"reason\": \"one short line, max 12 words\"}\n  ]\n}\nInclude every pick from DATA; set prob at or below price when there is no copy value left.`;\n// HERMES-009: carry the US-availability exclusion note into the report\nreturn [{ json: { skip: false, promptText, picks: compact, usNote: inputItems[0] && inputItems[0].usNote ? inputItems[0].usNote : null } }];"
+   }
+  },
+  {
+   "id": "00000000-0000-4000-8000-000000000012",
+   "name": "IF has picks",
+   "type": "n8n-nodes-base.if",
+   "typeVersion": 1,
+   "position": [
+    2080,
+    200
+   ],
+   "parameters": {
+    "conditions": {
+     "boolean": [
+      {
+       "value1": "={{ $json.skip }}",
+       "value2": true
+      }
+     ]
+    }
+   }
+  },
+  {
+   "id": "00000000-0000-4000-8000-000000000013",
+   "name": "Discord: no picks",
+   "type": "n8n-nodes-base.httpRequest",
+   "typeVersion": 4.2,
+   "position": [
+    2320,
+    60
+   ],
+   "parameters": {
+    "method": "POST",
+    "url": "https://discord.com/api/webhooks/1549651645233762355/qdURyTdA2vADBc9tXkFZz1O57ObuDqXqDZSz3Fky7og6R6uokPAaN9oFR1m6N1SnlHNB",
+    "sendHeaders": false,
+    "sendBody": true,
+    "specifyBody": "json",
+    "jsonBody": "={{ JSON.stringify({ content: 'Polymarket Smart Money Consensus \u2014 ' + new Date().toISOString().slice(0, 10) + ': ' + ($json.message || 'no strong consensus in the last 48h.') }) }}",
+    "options": {
+     "timeout": 30000
+    }
+   }
+  },
+  {
+   "id": "00000000-0000-4000-8000-000000000014",
+   "name": "HTTP Claude (analysis)",
+   "type": "n8n-nodes-base.httpRequest",
+   "typeVersion": 4.2,
+   "position": [
+    2320,
+    340
+   ],
+   "parameters": {
+    "method": "POST",
+    "url": "https://api.anthropic.com/v1/messages",
+    "authentication": "genericCredentialType",
+    "genericAuthType": "httpHeaderAuth",
+    "sendHeaders": true,
+    "headerParameters": {
+     "parameters": [
+      {
+       "name": "anthropic-version",
+       "value": "2023-06-01"
+      }
+     ]
+    },
+    "sendBody": true,
+    "specifyBody": "json",
+    "jsonBody": "={{ JSON.stringify({ model: 'claude-sonnet-4-5', max_tokens: 6000, system: 'You are a sharp, concise Polymarket copy-trading signal analyst. Output exactly what the user requests \u2014 nothing else.', messages: [{ role: 'user', content: $json.promptText }] }) }}",
+    "options": {
+     "timeout": 120000
+    }
+   },
+   "credentials": {
+    "httpHeaderAuth": {
+     "id": "anthropic-key-001",
+     "name": "Anthropic API Key"
+    }
+   }
+  },
+  {
+   "id": "00000000-0000-4000-8000-000000000015",
+   "name": "Extract Report",
+   "type": "n8n-nodes-base.code",
+   "typeVersion": 2,
+   "position": [
+    2560,
+    340
+   ],
+   "parameters": {
+    "mode": "runOnceForAllItems",
+    "jsCode": "// Copy-trading verdicts: RULE-BASED on consensus strength + drift; Kelly sized on a conviction premium\nconst claude = $input.first().json;\nconst text = (claude.content || []).map(c => c.text || '').join('\\n');\nconst bankroll = $('Bankroll Parse').first().json.bankroll;\nconst dateStr = new Date().toISOString().slice(0, 10);\n\nconst dataPicks = $('Prompt & Route').first().json.picks || [];\nconst byId = new Map(dataPicks.map((p, i) => [parseInt(p.id, 10), p]));\n\n// Discord ping/markdown sanitizer\nconst clean = s => String(s || '')\n  .replace(/@(everyone|here)/g, '@\\u200b$1')\n  .replace(/<@!?&?\\d+>/g, '')\n  .replace(/<#\\d+>/g, '')\n  .replace(/<a?:\\w+:\\d+>/g, '')\n  .replace(/\\|\\|/g, '')\n  .trim();\nconst trunc = (s, n) => { const a = Array.from(s); return a.length <= n ? s : a.slice(0, n).join(''); };\n\nlet picks = [];\nconst m = text.match(/```json\\s*([\\s\\S]*?)(```|$)/);\nif (m) { try { picks = (JSON.parse(m[1]).picks) || []; } catch (e) {} }\nelse { try { picks = JSON.parse(text).picks || []; } catch (e) {} }\n\nif (!picks.length) {\n  const esc = clean(text);\n  return [{ json: { reportText: trunc('**Polymarket Smart Money Copy Signals \u2014 ' + dateStr + '**\\n(no structured picks \u2014 raw analysis)\\n\\n' + esc, 1900), dateStr } }];\n}\n\n// Build verdicts with rule-based sizing\nconst entries = [];\nfor (const p of picks.slice(0, 15)) {\n  const dp = byId.get(parseInt(p.id, 10)) || {};\n  const price = parseFloat(p.price);\n  const side = clean(String(p.side || '?')).toUpperCase().substring(0, 20);\n  const reason = clean(p.reason);\n  const traders = parseInt(dp.traders, 10) || 0;\n  const usd = dp.smart_money_usd || 0;\n  const hoursAgo = dp.hours_ago != null ? parseInt(dp.hours_ago, 10) : null;\n  const settleDays = dp.settles_in_days != null ? parseInt(dp.settles_in_days, 10) : null;\n  const drift = dp.drift_pct != null ? parseFloat(dp.drift_pct) : null;\n\n  let verdict = null;\n  let stake = 0;\n  let shares = 0;\n  // RULE: fresh consensus (>=3 top traders) + price still within +10% of their entry = copy signal\n  if (!(price > 0.01 && price < 0.999)) {\n    verdict = '\ud83d\udeab SKIP \u2014 invalid price';\n  } else if (usd < 10000) {\n    verdict = '\ud83d\udeab SKIP \u2014 small signal (<$10k smart money)';\n  } else if (price >= 0.99) {\n    verdict = '\ud83d\udc40 WATCH \u2014 at ceiling, no profit room';\n  } else if (traders >= 3 && drift !== null && drift >= -30 && drift <= 6 && (hoursAgo === null || hoursAgo <= 24)) {\n    const premium = Math.min(0.08, 0.04 + 0.01 * Math.max(0, traders - 3) + (drift <= 0 ? 0.01 : 0));\n    const qEff = Math.min(0.99, Math.max(0.02, price + premium));\n    const kelly = (qEff - price) / (1 - price);\n    stake = Math.min(0.5 * kelly * bankroll, 0.15 * bankroll);\n    shares = Math.floor(stake / price);\n    verdict = '\ud83d\udc49 COPY \u2014 bet the ' + side + ' side @ ' + price.toFixed(3) + ' \u2014 stake $' + stake.toFixed(2) + ' (~' + shares + ' sh)';\n  } else if (drift !== null && drift <= 15 && drift >= -30) {\n    verdict = '\ud83d\udc40 WATCH \u2014 ran +' + drift.toFixed(0) + '% from entry';\n  } else {\n    verdict = '\ud83d\udeab SKIP \u2014 ran ' + (drift !== null ? '+' + drift.toFixed(0) + '%' : 'too far') + ' from entry';\n  }\n  const driftTxt = drift !== null ? 'entry ' + (dp.entry_price || 0).toFixed(3) + (drift >= 0 ? ', +' : ', ') + drift.toFixed(1) + '%' : '';\n  const usdTxt = usd ? ' \u00b7 $' + (usd >= 1e6 ? (usd / 1e6).toFixed(2) + 'M' : usd >= 1000 ? (usd / 1000).toFixed(1) + 'k' : usd.toFixed(0)) : '';\n  const settleTxt = settleDays !== null ? (settleDays <= 0 ? ' \u00b7 settles today' : ' \u00b7 settles in ' + settleDays + 'd') : '';\n  const stats = traders + ' traders' + usdTxt + (hoursAgo != null ? ' \u00b7 ' + hoursAgo + 'h ago' : '') + (driftTxt ? ' \u00b7 ' + driftTxt : '') + settleTxt;\n  const url = dp.url || '';\n  const mkt = clean(String(p.market || '?')).substring(0, 90);\n  // HERMES-008: append the exact market URL so manual execution matches the right market (same-name mixups)\n  entries.push({ verdict, stake, line: '**' + mkt + '**' + (url ? ' \u2014 ' + url : '') + '\\n' + verdict + '\\n' + stats + '\\n' + reason });\n}\n\n// Cap TOTAL exposure at 25% of bankroll (scale stakes down proportionally)\nconst total = entries.reduce((s, e) => s + e.stake, 0);\nconst cap = 0.25 * bankroll;\nif (total > cap && total > 0) {\n  const scale = cap / total;\n  for (const e of entries) {\n    e.stake *= scale;\n    const priceMatch = e.line.match(/@ (\\d+\\.\\d+) \u2014 stake \\$([\\d.]+) \\((\\d+) sh\\)/);\n    if (priceMatch) {\n      const price = parseFloat(priceMatch[1]);\n      const newShares = Math.floor(e.stake / price);\n      e.line = e.line.replace(/stake \\$[\\d.]+ \\(\\d+ sh\\)/, 'stake $' + e.stake.toFixed(2) + ' (' + newShares + ' sh)');\n    }\n  }\n}\nconst totalExposure = entries.reduce((s, e) => s + e.stake, 0);\nconst actionable = entries.filter(e => e.verdict.includes('COPY') || e.verdict.includes('WATCH'));\nconst shown = (actionable.length > 0 ? actionable : entries).slice(0, 8).map(e => e.line).join('\\n\\n');\n\nlet out = '**Polymarket Smart Money Copy Signals \u2014 ' + dateStr + '**\\n**Bankroll: $' + bankroll.toFixed(2) + '**\\n_Exit plan: take profit at +15% or before settlement \u00b7 cut at -20% from entry_\\n\\n';\n  // HERMES-009: surface markets excluded for US availability\n  const usNote = $('Prompt & Route').first().json.usNote;\n  if (usNote) out += usNote + '\\n\\n';\n\nif (shown) out += shown + '\\n\\n';\nif (actionable.length === 0) out += '_No copy signals \u2014 consensus stale or already repriced._\\n';\nout += '**Total suggested exposure: $' + totalExposure.toFixed(2) + ' (' + Math.round(100 * totalExposure / bankroll) + '% of bankroll)**';\nreturn [{ json: { reportText: trunc(out, 1950), dateStr } }];"
+   }
+  },
+  {
+   "id": "00000000-0000-4000-8000-000000000016",
+   "name": "Discord: report",
+   "type": "n8n-nodes-base.httpRequest",
+   "typeVersion": 4.2,
+   "position": [
+    2800,
+    340
+   ],
+   "parameters": {
+    "method": "POST",
+    "url": "https://discord.com/api/webhooks/1549651645233762355/qdURyTdA2vADBc9tXkFZz1O57ObuDqXqDZSz3Fky7og6R6uokPAaN9oFR1m6N1SnlHNB",
+    "sendHeaders": false,
+    "sendBody": true,
+    "specifyBody": "json",
+    "jsonBody": "={{ JSON.stringify({ content: $json.reportText.substring(0, 1950) }) }}",
+    "options": {
+     "timeout": 30000
+    }
+   }
+  },
+  {
+   "id": "00000000-0000-4000-8000-000000000017",
+   "name": "Merge Gamma + Picks",
+   "type": "n8n-nodes-base.merge",
+   "typeVersion": 2,
+   "position": [
+    1820,
+    480
+   ],
+   "parameters": {
+    "mode": "append"
+   }
+  },
+  {
+   "id": "00000000-0000-4000-8000-000000000018",
+   "name": "IF has verified picks",
+   "type": "n8n-nodes-base.if",
+   "typeVersion": 1,
+   "position": [
+    2320,
+    200
+   ],
+   "parameters": {
+    "conditions": {
+     "boolean": [
+      {
+       "value1": "={{ $json.skip }}",
+       "value2": true
+      }
+     ]
+    }
+   }
+  },
+  {
+   "id": "00000000-0000-4000-8000-000000000019",
+   "name": "Read Bankroll",
+   "type": "n8n-nodes-base.executeCommand",
+   "typeVersion": 1,
+   "position": [
+    260,
+    480
+   ],
+   "parameters": {
+    "command": "cat /root/polymarket-bankroll.txt"
+   }
+  },
+  {
+   "id": "00000000-0000-4000-8000-000000000020",
+   "name": "Bankroll Parse",
+   "type": "n8n-nodes-base.code",
+   "typeVersion": 2,
+   "position": [
+    520,
+    480
+   ],
+   "parameters": {
+    "mode": "runOnceForAllItems",
+    "jsCode": "// Parse bankroll from the file output; default $100\nconst raw = $input.all().map(i => i.json).map(j => j.stdout || JSON.stringify(j)).join(' ') || '100';\nconst m = raw.match(/(\\d+(\\.\\d+)?)/);\nlet bankroll = m ? parseFloat(m[1]) : 100;\nif (!isFinite(bankroll) || bankroll <= 0) bankroll = 100;\nreturn [{ json: { bankroll: Math.round(bankroll * 100) / 100 } }];"
+   }
+  },
+  {
+   "id": "aaaaaaaa-0000-4000-8000-0000000000a1",
+   "name": "Guard (secret header)",
+   "type": "n8n-nodes-base.code",
+   "typeVersion": 2,
+   "position": [
+    160,
+    300
+   ],
+   "parameters": {
+    "jsCode": "// Hardening: only allow manual triggers with the shared secret header\nconst h = $json.headers || {};\nconst key = h['x-consensus-key'] || h['X-Consensus-Key'];\nif (key !== 'k3lly-0de036abc799e947') {\n  throw new Error('Unauthorized: missing/invalid x-consensus-key header');\n}\nreturn $input.all();"
+   }
+  }
+ ],
+ "connections": {
+  "Webhook (manual run)": {
+   "main": [
+    [
+     {
+      "node": "Guard (secret header)",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "HTTP Leaderboard": {
+   "main": [
+    [
+     {
+      "node": "Prep Traders",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Prep Traders": {
+   "main": [
+    [
+     {
+      "node": "HTTP Trades (per trader)",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "HTTP Trades (per trader)": {
+   "main": [
+    [
+     {
+      "node": "Fresh BUYs (48h)",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Fresh BUYs (48h)": {
+   "main": [
+    [
+     {
+      "node": "Find Consensus",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Find Consensus": {
+   "main": [
+    [
+     {
+      "node": "IF has picks",
+      "type": "main",
+      "index": 0
+     },
+     {
+      "node": "Verify Query",
+      "type": "main",
+      "index": 0
+     },
+     {
+      "node": "Merge Gamma + Picks",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Verify Query": {
+   "main": [
+    [
+     {
+      "node": "HTTP Gamma (verify markets)",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "HTTP Gamma (verify markets)": {
+   "main": [
+    [
+     {
+      "node": "Merge Gamma + Picks",
+      "type": "main",
+      "index": 1
+     }
+    ]
+   ]
+  },
+  "Verify & Enrich": {
+   "main": [
+    [
+     {
+      "node": "US Availability Gate",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Prompt & Route": {
+   "main": [
+    [
+     {
+      "node": "IF has verified picks",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "IF has picks": {
+   "main": [
+    [
+     {
+      "node": "Discord: no picks",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "HTTP Claude (analysis)": {
+   "main": [
+    [
+     {
+      "node": "Extract Report",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Extract Report": {
+   "main": [
+    [
+     {
+      "node": "Discord: report",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Merge Gamma + Picks": {
+   "main": [
+    [
+     {
+      "node": "Verify & Enrich",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "IF has verified picks": {
+   "main": [
+    [
+     {
+      "node": "Discord: no picks",
+      "type": "main",
+      "index": 0
+     }
+    ],
+    [
+     {
+      "node": "HTTP Claude (analysis)",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Read Bankroll": {
+   "main": [
+    [
+     {
+      "node": "Bankroll Parse",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Guard (secret header)": {
+   "main": [
+    [
+     {
+      "node": "HTTP Leaderboard",
+      "type": "main",
+      "index": 0
+     },
+     {
+      "node": "Read Bankroll",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "Schedule (daily 07:00+18:00 NY)": {
+   "main": [
+    [
+     {
+      "node": "HTTP Leaderboard",
+      "type": "main",
+      "index": 0
+     },
+     {
+      "node": "Read Bankroll",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  },
+  "US Availability Gate": {
+   "main": [
+    [
+     {
+      "node": "Prompt & Route",
+      "type": "main",
+      "index": 0
+     }
+    ]
+   ]
+  }
+ },
+ "settings": {
+  "executionOrder": "v2"
+ },
+ "versionId": "30771862-3c40-4172-9968-dbbc848b2748",
+ "activeVersionId": "30771862-3c40-4172-9968-dbbc848b2748",
+ "active": 1,
+ "versionCounter": 57
+}
